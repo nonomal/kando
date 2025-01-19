@@ -8,6 +8,8 @@
 // SPDX-FileCopyrightText: Simon Schneegans <code@simonschneegans.de>
 // SPDX-License-Identifier: MIT
 
+import i18next from 'i18next';
+
 import { EventEmitter } from 'events';
 import { IMenu } from '../../../common';
 
@@ -34,6 +36,12 @@ export class AdvancedOptionsPicker extends EventEmitter {
    */
   private anchoredModeCheckbox: HTMLInputElement = null;
 
+  /**
+   * The warp mouse checkbox is a checkbox that allows the user to toggle whether the
+   * mouse should be warped to the center of the menu when it is opened.
+   */
+  private warpMouseCheckbox: HTMLInputElement = null;
+
   /** The currently active menu. */
   private menu: IMenu = null;
 
@@ -50,12 +58,22 @@ export class AdvancedOptionsPicker extends EventEmitter {
     const template = require('./templates/advanced-options-picker.hbs');
     container.classList.value = 'd-flex flex-column justify-content-center hidden';
     container.innerHTML = template({
-      heading: "Tweak the Menu's Behavior",
-      subheading:
-        "Before you enable these options, we recommend learning Kando's default behavior. Read about why we like it <a %s>here</a>.".replace(
-          '%s',
-          'target="_blank" href="https://github.com/kando-menu/kando/blob/main/docs/usage.md"'
+      strings: {
+        heading: i18next.t('properties.advanced-options.heading'),
+        subheading: i18next.t('properties.advanced-options.subheading', {
+          link: 'target="_blank" href="https://kando.menu/usage/"',
+        }),
+        centeredMode: i18next.t('properties.advanced-options.centered-mode'),
+        centeredModeHint: i18next.t('properties.advanced-options.centered-mode-hint'),
+        warpMouse: i18next.t('properties.advanced-options.warp-mouse'),
+        warpMouseHint: i18next.t('properties.advanced-options.warp-mouse-hint'),
+        anchoredMode: i18next.t('properties.advanced-options.anchored-mode'),
+        anchoredModeHint: i18next.t('properties.advanced-options.anchored-mode-hint'),
+        anchoredModeCheckedHint: i18next.t(
+          'properties.advanced-options.anchored-mode-checked-hint'
         ),
+        done: i18next.t('properties.common.done'),
+      },
     });
 
     // Update the 'centered' property of the menu when the checkbox changes.
@@ -65,6 +83,16 @@ export class AdvancedOptionsPicker extends EventEmitter {
     this.centeredModeCheckbox.addEventListener('change', () => {
       if (this.menu) {
         this.menu.centered = this.centeredModeCheckbox.checked;
+      }
+    });
+
+    // Update the 'warpMouse' property of the menu when the checkbox changes.
+    this.warpMouseCheckbox = container.querySelector(
+      '#kando-menu-properties-warp-mouse'
+    ) as HTMLInputElement;
+    this.warpMouseCheckbox.addEventListener('change', () => {
+      if (this.menu) {
+        this.menu.warpMouse = this.warpMouseCheckbox.checked;
       }
     });
 
@@ -102,6 +130,7 @@ export class AdvancedOptionsPicker extends EventEmitter {
   public setMenu(menu: IMenu) {
     this.menu = menu;
     this.centeredModeCheckbox.checked = menu.centered;
+    this.warpMouseCheckbox.checked = menu.warpMouse;
     this.anchoredModeCheckbox.checked = menu.anchored;
   }
 }

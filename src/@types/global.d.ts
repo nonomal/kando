@@ -16,6 +16,8 @@ import {
   IMenuSettings,
   IShowMenuOptions,
   IShowEditorOptions,
+  IIconThemesInfo,
+  IVersionInfo,
 } from '../common';
 
 // Declare the API to the host process. See preload.ts for more information on the exposed
@@ -24,6 +26,9 @@ import {
 declare global {
   interface Window {
     api: {
+      rendererReady: () => void;
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      getLocales: () => Promise<{ current: string; data: any; fallbackLng: any }>;
       appSettings: {
         get: () => Promise<IAppSettings>;
         getKey: <K extends keyof IAppSettings>(key: K) => Promise<IAppSettings[K]>;
@@ -38,17 +43,18 @@ declare global {
         set: (data: IMenuSettings) => void;
         getCurrentMenu: () => Promise<number>;
       };
+      getVersion: () => Promise<IVersionInfo>;
       getBackendInfo: () => Promise<IBackendInfo>;
       getMenuTheme: () => Promise<IMenuThemeDescription>;
       getAllMenuThemes: () => Promise<Array<IMenuThemeDescription>>;
+      getSoundTheme: () => Promise<ISoundThemeDescription>;
       getCurrentMenuThemeColors: () => Promise<Record<string, string>>;
       getIsDarkMode: () => Promise<boolean>;
       darkModeChanged: (callback: (darkMode: boolean) => void) => void;
-      getUserIconThemeDirectory: () => Promise<string>;
-      getUserIconThemes: () => Promise<Array<string>>;
-      listUserIcons: (string: iconTheme) => Promise<Array<string>>;
+      getIconThemes: () => Promise<IIconThemesInfo>;
       showDevTools: () => void;
       reloadMenuTheme: () => void;
+      reloadSoundTheme: () => void;
       movePointer: (dist: IVec2) => void;
       log: (message: string) => void;
       showMenu: (

@@ -25,6 +25,22 @@ import {
  */
 contextBridge.exposeInMainWorld('api', {
   /**
+   * This will be called by the renderer process when it is fully loaded. This is used to
+   * notify the host process that the renderer process is ready to receive messages.
+   */
+  rendererReady: function () {
+    ipcRenderer.send('renderer-ready');
+  },
+
+  /**
+   * This will return the current locale and all localization strings loaded by i18next
+   * for the current and all potential fallback locales.
+   */
+  getLocales: function () {
+    return ipcRenderer.invoke('get-locales');
+  },
+
+  /**
    * The appSettings object can be used to read and write the app settings. The settings
    * are persisted in the host process. When a setting is changed, the host process will
    * notify the renderer process.
@@ -68,6 +84,11 @@ contextBridge.exposeInMainWorld('api', {
     },
   },
 
+  /** Returns the current version string of Kando. */
+  getVersion: function () {
+    return ipcRenderer.invoke('get-version');
+  },
+
   /** This will return some information about the currently used backend. */
   getBackendInfo: function () {
     return ipcRenderer.invoke('get-backend-info');
@@ -81,6 +102,11 @@ contextBridge.exposeInMainWorld('api', {
   /** This will return all available menu themes. */
   getAllMenuThemes: function () {
     return ipcRenderer.invoke('get-all-menu-themes');
+  },
+
+  /** This will return the descriptions of the currently used sound theme. */
+  getSoundTheme: function () {
+    return ipcRenderer.invoke('get-sound-theme');
   },
 
   /**
@@ -101,26 +127,9 @@ contextBridge.exposeInMainWorld('api', {
     ipcRenderer.on('dark-mode-changed', (e, darkMode) => callback(darkMode));
   },
 
-  /** This will return the path to the user's icon theme directory in the config directory. */
-  getUserIconThemeDirectory: function () {
-    return ipcRenderer.invoke('get-user-icon-theme-directory');
-  },
-
-  /**
-   * This will return all subdirectories of the icon-themes directory in the config
-   * directory.
-   */
-  getUserIconThemes: function () {
-    return ipcRenderer.invoke('get-user-icon-themes');
-  },
-
-  /**
-   * This will return all files in the given icon theme directory.
-   *
-   * @param iconTheme The icon theme to list.
-   */
-  listUserIcons: function (iconTheme: string) {
-    return ipcRenderer.invoke('list-user-icons', iconTheme);
+  /** This will return a IIconThemesInfo describing all available icon themes. */
+  getIconThemes: function () {
+    return ipcRenderer.invoke('get-icon-themes');
   },
 
   /** This will show the web developer tools. */
@@ -131,6 +140,11 @@ contextBridge.exposeInMainWorld('api', {
   /** This will reload the current menu theme. */
   reloadMenuTheme: function () {
     ipcRenderer.send('reload-menu-theme');
+  },
+
+  /** This will reload the current menu theme. */
+  reloadSoundTheme: function () {
+    ipcRenderer.send('reload-sound-theme');
   },
 
   /**

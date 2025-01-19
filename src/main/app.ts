@@ -24,6 +24,7 @@ import {
   nativeTheme,
 } from 'electron';
 import { Notification } from 'electron';
+import i18next from 'i18next';
 
 import { Backend, getBackend } from './backends';
 import {
@@ -32,6 +33,9 @@ import {
   IMenuSettings,
   IAppSettings,
   IShowMenuRequest,
+  IIconThemesInfo,
+  ISoundThemeDescription,
+  IMenuThemeDescription,
 } from '../common';
 import { Settings, DeepReadonly } from './settings';
 import { ItemActionRegistry } from '../common/item-action-registry';
@@ -62,13 +66,16 @@ export class KandoApp {
    * covers the whole screen. It is always on top and has no frame. It is used to display
    * the pie menu.
    */
-  private window: BrowserWindow;
+  private window?: BrowserWindow;
 
   /** This timeout is used to hide the window after the fade-out animation. */
   private hideTimeout: NodeJS.Timeout;
 
   /** This flag is used to determine if the bindShortcuts() method is currently running. */
   private bindingShortcuts = false;
+
+  /** True if shortcuts are currently inhibited. */
+  private inhibitShortcuts = false;
 
   /**
    * This is the tray icon which is displayed in the system tray. In the future it will be
@@ -89,33 +96,13 @@ export class KandoApp {
    * This is the settings object which is used to store the general application settings
    * in the user's home directory.
    */
-  private appSettings = new Settings<IAppSettings>({
-    file: 'config.json',
-    directory: app.getPath('userData'),
-    defaults: {
-      menuTheme: 'default',
-      darkMenuTheme: 'default',
-      menuThemeColors: {},
-      darkMenuThemeColors: {},
-      enableDarkModeForMenuThemes: false,
-      sidebarVisible: true,
-      enableVersionCheck: true,
-      zoomFactor: 1,
-    },
-  });
+  private appSettings: Settings<IAppSettings>;
 
   /**
    * This is the settings object which is used to store the configured menus in the user's
    * home directory.
    */
-  private menuSettings = new Settings<IMenuSettings>({
-    file: 'menus.json',
-    directory: app.getPath('userData'),
-    defaults: {
-      menus: [this.createExampleMenu()],
-      templates: [],
-    },
-  });
+  private menuSettings: Settings<IMenuSettings>;
 
   /** This is called when the app is started. It initializes the backend and the window. */
   public async init() {
@@ -126,10 +113,70 @@ export class KandoApp {
 
     await this.backend.init();
 
+    // We load the settings from the user's home directory. If the settings file does not
+    // exist, it will be created with the default values.
+    this.appSettings = new Settings<IAppSettings>({
+      file: 'config.json',
+      directory: app.getPath('userData'),
+      defaults: {
+        locale: 'auto',
+        menuTheme: 'default',
+        darkMenuTheme: 'default',
+        menuThemeColors: {},
+        darkMenuThemeColors: {},
+        enableDarkModeForMenuThemes: false,
+        soundTheme: 'none',
+        soundVolume: 0.5,
+        sidebarVisible: true,
+        ignoreWriteProtectedConfigFiles: false,
+        trayIconFlavor: 'color',
+        enableVersionCheck: true,
+        zoomFactor: 1,
+        menuOptions: {
+          centerDeadZone: 50,
+          minParentDistance: 150,
+          dragThreshold: 15,
+          fadeInDuration: 150,
+          fadeOutDuration: 200,
+          enableMarkingMode: true,
+          enableTurboMode: true,
+          gestureMinStrokeLength: 150,
+          gestureMinStrokeAngle: 20,
+          gestureJitterThreshold: 10,
+          gesturePauseTimeout: 100,
+          fixedStrokeLength: 0,
+          rmbSelectsParent: false,
+          gamepadBackButton: 1,
+          gamepadCloseButton: 2,
+        },
+        editorOptions: {
+          showSidebarButtonVisible: true,
+          showEditorButtonVisible: true,
+        },
+      },
+    });
+
+    // We load the menu settings from the user's home directory. If the settings file does
+    // not exist, it will be created with the default values.
+    this.menuSettings = new Settings<IMenuSettings>({
+      file: 'menus.json',
+      directory: app.getPath('userData'),
+      defaults: {
+        menus: [],
+        templates: [],
+      },
+    });
+
+    // Tell i18next to use a specific locale if it is set in the settings.
+    const locale = this.appSettings.get('locale');
+    if (locale !== 'auto') {
+      i18next.changeLanguage(locale);
+    }
+
     // Try migrating settings from an old version of Kando.
     this.migrateSettings();
 
-    // We ensure that there is always a menu avaliable. If the user deletes all menus,
+    // We ensure that there is always a menu available. If the user deletes all menus,
     // we create a new example menu when Kando is started the next time.
     if (this.menuSettings.get('menus').length === 0) {
       this.menuSettings.set({
@@ -142,7 +189,7 @@ export class KandoApp {
     // not shown. If the window is shown, the shortcuts are already unbound and will be
     // rebound when the window is hidden.
     this.menuSettings.onChange('menus', async () => {
-      if (!this.window.isVisible()) {
+      if (!this.window?.isVisible()) {
         await this.bindShortcuts();
       }
       this.updateTrayMenu();
@@ -150,14 +197,30 @@ export class KandoApp {
 
     // When the app settings change, we need to apply the zoom factor to the window.
     this.appSettings.onChange('zoomFactor', (newValue) => {
-      this.window.webContents.setZoomFactor(newValue);
+      this.window?.webContents.setZoomFactor(newValue);
+    });
+
+    // Check if we want to silently handle read-only config files
+    this.appSettings.ignoreWriteProtectedConfigFiles = this.appSettings.get(
+      'ignoreWriteProtectedConfigFiles'
+    );
+    this.menuSettings.ignoreWriteProtectedConfigFiles = this.appSettings.get(
+      'ignoreWriteProtectedConfigFiles'
+    );
+
+    // When ignoreWriteProtectedConfigFiles becomes true we want to apply this immediately.
+    this.appSettings.onChange('ignoreWriteProtectedConfigFiles', (newValue) => {
+      this.appSettings.ignoreWriteProtectedConfigFiles = newValue;
+      this.menuSettings.ignoreWriteProtectedConfigFiles = newValue;
+    });
+
+    // Update the tray icon if the tray icon flavor changes.
+    this.appSettings.onChange('trayIconFlavor', () => {
+      this.updateTrayMenu(true);
     });
 
     // Initialize the IPC communication to the renderer process.
     this.initRendererIPC();
-
-    // Create and load the main window.
-    await this.initWindow();
 
     // Bind the shortcuts for all menus.
     await this.bindShortcuts();
@@ -179,7 +242,7 @@ export class KandoApp {
       );
 
       // Show the update-available button in the sidebar.
-      this.window.webContents.send('show-update-available-button');
+      this.window?.webContents.send('show-update-available-button');
 
       // Show the sidebar if it is hidden.
       this.appSettings.set({ sidebarVisible: true });
@@ -340,9 +403,8 @@ export class KandoApp {
    * @param request Required information to select correct menu.
    */
   public showMenu(request: IShowMenuRequest) {
-    this.backend
-      .getWMInfo()
-      .then((info) => {
+    Promise.all([this.backend.getWMInfo(), this.initWindow()])
+      .then(([info]) => {
         // Select correct menu before showing it to user.
         const menu = this.chooseMenu(request, info);
 
@@ -360,28 +422,32 @@ export class KandoApp {
         // shortcut for the previous menu had been unbound when showing it, we have to
         // rebind it here (if it was a different one).
         const useID = !this.backend.getBackendInfo().supportsShortcuts;
-        const newTrigger = useID ? menu.shortcut : menu.shortcutID;
-        const oldTrigger = useID ? this.lastMenu?.shortcut : this.lastMenu?.shortcutID;
+        const newTrigger = useID ? menu.shortcutID : menu.shortcut;
+        const oldTrigger = useID ? this.lastMenu?.shortcutID : this.lastMenu?.shortcut;
 
-        if (this.window.isVisible() && oldTrigger != newTrigger) {
-          // Rebind the trigger for the previous menu. If the hideTimeout is set, the
-          // window is about to be hidden and the shortcuts have been rebound already.
-          if (oldTrigger && !this.hideTimeout) {
-            this.backend.bindShortcut({
-              trigger: oldTrigger,
-              action: () => {
-                this.showMenu({
-                  trigger: oldTrigger,
-                  name: '',
-                });
-              },
-            });
-          }
+        // First, unbind the trigger for the new menu.
+        if (newTrigger) {
+          this.backend.unbindShortcut(newTrigger);
+        }
 
-          // Unbind the trigger for the new menu.
-          if (newTrigger) {
-            this.backend.unbindShortcut(newTrigger);
-          }
+        // If old and new trigger are the same, we don't need to rebind it. If the
+        // hideTimeout is set, the window is about to be hidden and the shortcuts have
+        // been rebound already.
+        if (
+          oldTrigger &&
+          oldTrigger != newTrigger &&
+          this.window.isVisible() &&
+          !this.hideTimeout
+        ) {
+          this.backend.bindShortcut({
+            trigger: oldTrigger,
+            action: () => {
+              this.showMenu({
+                trigger: oldTrigger,
+                name: '',
+              });
+            },
+          });
         }
 
         // Store the last menu to be able to execute the selected action later. The WMInfo
@@ -416,13 +482,12 @@ export class KandoApp {
           });
         }
 
-        // Some platforms require the window to be one pixel larger than the work area.
-        // Else there will be a small gap between the window and the screen edge.
+        // Move and resize the window to the work area of the screen where the pointer is.
         this.window.setBounds({
           x: workarea.x,
           y: workarea.y,
-          width: workarea.width + 1,
-          height: workarea.height + 1,
+          width: workarea.width,
+          height: workarea.height,
         });
 
         // On all platforms except Windows, we show the window after we moved it.
@@ -459,6 +524,7 @@ export class KandoApp {
             zoomFactor: this.window.webContents.getZoomFactor(),
             centeredMode: this.lastMenu.centered,
             anchoredMode: this.lastMenu.anchored,
+            warpMouse: this.lastMenu.warpMouse,
           },
           {
             appName: info.appName,
@@ -486,9 +552,8 @@ export class KandoApp {
    * example in the condition picker of the menu editor.
    */
   public showEditor() {
-    this.backend
-      .getWMInfo()
-      .then((info) => {
+    Promise.all([this.backend.getWMInfo(), this.initWindow()])
+      .then(([info]) => {
         this.window.webContents.send('show-editor', {
           appName: info.appName,
           windowName: info.windowName,
@@ -513,12 +578,26 @@ export class KandoApp {
     );
   }
 
+  /** This is called when the --reload-sound-theme command line option is passed. */
+  public reloadSoundTheme() {
+    this.window.webContents.send(
+      `app-settings-changed-soundTheme`,
+      this.appSettings.get('soundTheme'),
+      this.appSettings.get('soundTheme')
+    );
+  }
+
   /**
    * This creates the main window. It is a transparent window which covers the whole
    * screen. It is not shown in any task bar and has no frame. It is used to display the
    * pie menu and potentially other UI elements such as the menu editor.
    */
   private async initWindow() {
+    // Bail out if the window is already created.
+    if (this.window) {
+      return;
+    }
+
     const display = screen.getPrimaryDisplay();
 
     this.window = new BrowserWindow({
@@ -529,6 +608,11 @@ export class KandoApp {
         // system. In development mode, the app is loaded from the webpack dev server.
         // Hence, we have to disable webSecurity in development mode.
         webSecurity: process.env.NODE_ENV !== 'development',
+        // Background throttling is disabled to make sure that the menu is properly
+        // hidden. Else it can happen that the last frame of a previous menu is still
+        // visible when the new menu is shown. For now, I have not seen any issues with
+        // background throttling disabled.
+        backgroundThrottling: false,
         preload: MAIN_WINDOW_PRELOAD_WEBPACK_ENTRY,
       },
       transparent: true,
@@ -542,6 +626,31 @@ export class KandoApp {
       height: display.workArea.height + 1,
       type: this.backend.getBackendInfo().windowType,
       show: false,
+    });
+
+    // Remove the default menu. This disables all default shortcuts like CMD+W which are
+    // not needed in Kando.
+    this.window.setMenu(null);
+
+    // However, we still want to allow the user to zoom the menu using Ctrl+, Ctrl-, and
+    // Ctrl+0. We have to handle these shortcuts manually.
+    this.window.webContents.on('before-input-event', (event, input) => {
+      if (input.control && (input.key === '+' || input.key === '-')) {
+        let zoomFactor = this.window.webContents.getZoomFactor();
+        zoomFactor = input.key === '+' ? zoomFactor + 0.1 : zoomFactor - 0.1;
+        this.appSettings.set({ zoomFactor });
+        event.preventDefault();
+      }
+
+      if (input.control && input.key === '0') {
+        this.appSettings.set({ zoomFactor: 1 });
+        event.preventDefault();
+      }
+
+      // We prevent CMD+W to close the window.
+      if (input.meta && input.key === 'w') {
+        event.preventDefault();
+      }
     });
 
     // We set the window to be always on top. This way, Kando will be visible even on
@@ -562,10 +671,17 @@ export class KandoApp {
       return { action: 'deny' };
     });
 
+    // We return a promise which resolves when the renderer process is ready.
+    const promise = new Promise<void>((resolve) => {
+      ipcMain.on('renderer-ready', () => resolve());
+    });
+
     await this.window.loadURL(MAIN_WINDOW_WEBPACK_ENTRY);
 
     // Apply the stored zoom factor to the window.
     this.window.webContents.setZoomFactor(this.appSettings.get('zoomFactor'));
+
+    return promise;
   }
 
   /**
@@ -573,6 +689,15 @@ export class KandoApp {
    * more information on the exposed functionality.
    */
   private initRendererIPC() {
+    // Allow the renderer to retrieve the i18next locales.
+    ipcMain.handle('get-locales', () => {
+      return {
+        current: i18next.language,
+        data: i18next.store.data,
+        fallbackLng: i18next.options.fallbackLng,
+      };
+    });
+
     // Allow the renderer to access the app settings. We do this by exposing the
     // a setter, a getter, and an on-change event for each key in the settings object.
     for (const k of Object.keys(this.appSettings.defaults)) {
@@ -627,68 +752,47 @@ export class KandoApp {
       return Math.max(index, 0);
     });
 
+    // Allow the renderer to retrieve information about the current app version.
+    ipcMain.handle('get-version', () => {
+      return {
+        kandoVersion: app.getVersion(),
+        electronVersion: process.versions.electron,
+        chromeVersion: process.versions.chrome,
+        nodeVersion: process.versions.node,
+      };
+    });
+
     // Allow the renderer to retrieve information about the backend.
     ipcMain.handle('get-backend-info', () => {
       return this.backend.getBackendInfo();
     });
 
-    // Allow the renderer to retrieve the path to the user's icon theme directory.
-    ipcMain.handle('get-user-icon-theme-directory', () => {
-      return path.join(app.getPath('userData'), 'icon-themes');
-    });
+    // Allow the renderer to retrieve all icons of all file icon themes.
+    ipcMain.handle('get-icon-themes', async () => {
+      const info: IIconThemesInfo = {
+        userIconDirectory: path.join(app.getPath('userData'), 'icon-themes'),
+        fileIconThemes: [],
+      };
 
-    // Allow the renderer to retrieve all subdirectories of the icon-themes directory.
-    ipcMain.handle('get-user-icon-themes', async () => {
-      return new Promise<string[]>((resolve) => {
-        const iconThemesDir = path.join(app.getPath('userData'), 'icon-themes');
-        fs.readdir(iconThemesDir, { withFileTypes: true }, (err, dirents) => {
-          // We ignore ENOENT errors as they just mean that the directory does not exist.
-          // All other errors are printed to the console.
-          if (err) {
-            if (err.code !== 'ENOENT') {
-              console.error(err);
-            }
+      const themes = await this.listSubdirectories([
+        path.join(app.getPath('userData'), 'icon-themes'),
+        path.join(__dirname, '../renderer/assets/icon-themes'),
+      ]);
 
-            resolve([]);
-            return;
-          }
+      await Promise.all(
+        themes.map(async (theme) => {
+          const directory = await this.findIconThemePath(theme);
+          const icons = await this.listIconsRecursively(directory);
 
-          const iconThemes = dirents
-            .filter((dirent) => dirent.isDirectory())
-            .map((dirent) => dirent.name);
-
-          resolve(iconThemes);
-        });
-      });
-    });
-
-    // Allow the renderer to retrieve all files in the given icon theme directory.
-    ipcMain.handle('list-user-icons', async (event, iconTheme: string) => {
-      return new Promise<string[]>((resolve) => {
-        const iconDir = path.join(app.getPath('userData'), 'icon-themes', iconTheme);
-        fs.readdir(iconDir, { withFileTypes: true, recursive: true }, (err, files) => {
-          if (err) {
-            console.error(err);
-            resolve([]);
-            return;
-          }
-
-          // Filter by mimetype to only return image files.
-          files = files.filter((file) => {
-            if (!file.isFile()) {
-              return false;
-            }
-
-            const mimeType = mime.lookup(file.name);
-            return mimeType && mimeType.startsWith('image/');
+          info.fileIconThemes.push({
+            name: theme,
+            directory,
+            icons,
           });
+        })
+      );
 
-          // We return the relative path of the files to the icon theme directory.
-          resolve(
-            files.map((file) => path.relative(iconDir, path.join(file.path, file.name)))
-          );
-        });
-      });
+      return info;
     });
 
     // Allow the renderer to retrieve the description of the current menu theme. We also
@@ -697,18 +801,21 @@ export class KandoApp {
       const useDarkVariant =
         this.appSettings.get('enableDarkModeForMenuThemes') &&
         nativeTheme.shouldUseDarkColors;
-      return this.loadMenuDescription(
+      return this.loadMenuThemeDescription(
         this.appSettings.get(useDarkVariant ? 'darkMenuTheme' : 'menuTheme')
       );
     });
 
     // Allow the renderer to retrieve all available menu themes.
     ipcMain.handle('get-all-menu-themes', async () => {
-      const themes = await this.listMenuThemes();
+      const themes = await this.listSubdirectories([
+        path.join(app.getPath('userData'), 'menu-themes'),
+        path.join(__dirname, '../renderer/assets/menu-themes'),
+      ]);
 
       // Load all descriptions in parallel.
       const descriptions = await Promise.all(
-        themes.map((theme) => this.loadMenuDescription(theme))
+        themes.map((theme) => this.loadMenuThemeDescription(theme))
       );
 
       // Sort by the name property of the description.
@@ -739,10 +846,15 @@ export class KandoApp {
     // Allow the renderer to be notified when the system theme changes.
     let darkMode = nativeTheme.shouldUseDarkColors;
     nativeTheme.on('updated', () => {
-      if (darkMode !== nativeTheme.shouldUseDarkColors) {
+      if (this.window && darkMode !== nativeTheme.shouldUseDarkColors) {
         darkMode = nativeTheme.shouldUseDarkColors;
         this.window.webContents.send('dark-mode-changed', darkMode);
       }
+    });
+
+    // Allow the renderer to retrieve the description of the current sound theme.
+    ipcMain.handle('get-sound-theme', async () => {
+      return this.loadSoundThemeDescription(this.appSettings.get('soundTheme'));
     });
 
     // Once the editor is shown, we unbind all shortcuts to make sure that the
@@ -759,6 +871,11 @@ export class KandoApp {
     // Reload the current menu theme if requested.
     ipcMain.on('reload-menu-theme', async () => {
       this.reloadMenuTheme();
+    });
+
+    // Reload the current sound theme if requested.
+    ipcMain.on('reload-sound-theme', async () => {
+      this.reloadSoundTheme();
     });
 
     // Print a message to the console of the host process.
@@ -813,7 +930,7 @@ export class KandoApp {
       // Also wait with the execution of the selected action until the fade-out
       // animation is finished to make sure that any resulting events (such as virtual
       // key presses) are not captured by the window.
-      this.hideWindow(400).then(() => {
+      this.hideWindow().then(() => {
         // If the action is delayed, we execute it after the window is hidden.
         if (executeDelayed) {
           execute(item);
@@ -824,7 +941,7 @@ export class KandoApp {
     // We do not hide the window immediately when the user aborts a selection. Instead, we
     // wait for the fade-out animation to finish.
     ipcMain.on('cancel-selection', () => {
-      this.hideWindow(300);
+      this.hideWindow();
     });
   }
 
@@ -834,7 +951,7 @@ export class KandoApp {
    */
   private async bindShortcuts() {
     // This async function should not be run twice at the same time.
-    if (this.bindingShortcuts) {
+    if (this.bindingShortcuts || this.inhibitShortcuts) {
       return;
     }
 
@@ -879,20 +996,66 @@ export class KandoApp {
     this.bindingShortcuts = false;
   }
 
-  /** This updates the menu of the tray icon. It is called when the menu settings change. */
-  private updateTrayMenu() {
+  /**
+   * This updates the menu of the tray icon. It is called when the menu settings change or
+   * when the tray icon flavor changes.
+   */
+  private updateTrayMenu(flavorChanged = false) {
+    // If the flavor of the tray icon has changed, we have to destroy the old tray icon
+    // and create a new one.
+    if (flavorChanged) {
+      this.tray?.destroy();
+      this.tray = null;
+    }
+
+    // If the tray icon flavor is set to 'none', we do not show a tray icon.
+    let flavor = this.appSettings.get('trayIconFlavor');
+    if (flavor === 'none') {
+      return;
+    }
+
+    // The tray icons are not bundled via webpack, as the different resolutions for HiDPI
+    // displays on macOS or the flavors on Linux and Windows are loaded at runtime.
+    // Instead, the tray icons are copied to the assets directory during the build
+    // process. See webpack.plugins.ts for more information.
     if (!this.tray) {
       if (os.platform() === 'darwin') {
-        // On macOS, the tray icons are not bundled via webpack, as the different
-        // resolutions for HiDPI displays are loaded at runtime. Instead, the tray icons
-        // are copied to the assets directory during the build process.
-        // See webpack.plugins.ts for more information.
         this.tray = new Tray(path.join(__dirname, '../renderer/assets/trayTemplate.png'));
       } else {
-        this.tray = new Tray(
-          path.join(__dirname, require('../../assets/icons/icon.png'))
-        );
+        if (
+          flavor !== 'light' &&
+          flavor !== 'dark' &&
+          flavor !== 'color' &&
+          flavor !== 'black' &&
+          flavor !== 'white'
+        ) {
+          console.warn(`Unknown tray icon flavor: '${flavor}'. Using 'color' instead.`);
+          flavor = 'color';
+        }
+
+        let iconPath;
+
+        switch (flavor) {
+          case 'light':
+            iconPath = path.join(__dirname, require('../../assets/icons/trayLight.png'));
+            break;
+          case 'dark':
+            iconPath = path.join(__dirname, require('../../assets/icons/trayDark.png'));
+            break;
+          case 'color':
+            iconPath = path.join(__dirname, require('../../assets/icons/trayColor.png'));
+            break;
+          case 'black':
+            iconPath = path.join(__dirname, require('../../assets/icons/trayBlack.png'));
+            break;
+          case 'white':
+            iconPath = path.join(__dirname, require('../../assets/icons/trayWhite.png'));
+            break;
+        }
+
+        this.tray = new Tray(iconPath);
       }
+
       this.tray.setToolTip('Kando');
     }
 
@@ -903,7 +1066,7 @@ export class KandoApp {
       const trigger =
         (this.backend.getBackendInfo().supportsShortcuts
           ? menu.shortcut
-          : menu.shortcutID) || 'Not Bound';
+          : menu.shortcutID) || i18next.t('properties.common.not-bound');
       template.push({
         label: `${menu.root.name} (${trigger})`,
         click: () => {
@@ -922,6 +1085,27 @@ export class KandoApp {
       label: 'Show Settings',
       click: () => this.showEditor(),
     });
+
+    // Add an entry to pause or unpause the shortcuts.
+    if (this.inhibitShortcuts) {
+      template.push({
+        label: i18next.t('main.un-inhibit-shortcuts'),
+        click: () => {
+          this.inhibitShortcuts = false;
+          this.bindShortcuts();
+          this.updateTrayMenu();
+        },
+      });
+    } else {
+      template.push({
+        label: i18next.t('main.inhibit-shortcuts'),
+        click: () => {
+          this.inhibitShortcuts = true;
+          this.backend.unbindAllShortcuts();
+          this.updateTrayMenu();
+        },
+      });
+    }
 
     template.push({ type: 'separator' });
 
@@ -1016,7 +1200,7 @@ export class KandoApp {
    *
    * See also: https://stackoverflow.com/questions/50642126/previous-window-focus-electron
    */
-  private async hideWindow(delay = 0) {
+  private async hideWindow() {
     return new Promise<void>((resolve) => {
       if (this.hideTimeout) {
         clearTimeout(this.hideTimeout);
@@ -1037,23 +1221,27 @@ export class KandoApp {
         this.hideTimeout = null;
 
         resolve();
-      }, delay);
+      }, this.appSettings.get().menuOptions.fadeOutDuration);
     });
   }
 
   /**
-   * This finds the path to the menu theme's JSON or JSON5 file with the given directory
-   * name. If the theme is not found, the default theme is used instead. Kando will first
+   * This finds the path to a menu or sound theme's JSON or JSON5 file with the given
+   * directory names. So this searches for a "directory/theme.json(5)" file. It will first
    * look for the theme in the user's data directory. If it is not found there, it will
    * look in the app's assets directory.
    *
-   * @param theme The name of the menu theme's directory.
+   * If the theme is not found, an empty string is returned.
+   *
+   * @param directory The name of the directory where the theme is located. For now, this
+   *   should be either "menu-themes" or "sound-themes".
+   * @param theme The name of the theme's subdirectory.
    * @returns The absolute path to the menu theme's directory.
    */
-  private async findMenuThemePath(theme: string) {
+  private async findThemePath(directory: string, theme: string) {
     const testPaths = [
-      path.join(app.getPath('userData'), `menu-themes/${theme}`),
-      path.join(__dirname, `../renderer/assets/menu-themes/${theme}`),
+      path.join(app.getPath('userData'), `${directory}/${theme}`),
+      path.join(__dirname, `../renderer/assets/${directory}/${theme}`),
     ];
 
     const testFiles = ['theme.json', 'theme.json5'];
@@ -1072,42 +1260,102 @@ export class KandoApp {
       }
     }
 
-    console.error(`Menu theme "${theme}" not found. Using default theme instead.`);
-
-    return path.join(__dirname, `../renderer/assets/menu-themes/default/theme.json5`);
+    return '';
   }
 
   /**
-   * This lists all available menu themes. It will first look in the user's data directory
-   * and then in the app's assets directory.
+   * This finds the path to the given icon-theme directory name. If the theme is not
+   * found, an empty string is returned. Kando will first look for the theme in the user's
+   * data directory. If it is not found there, it will look in the app's assets
+   * directory.
    *
-   * @returns A list of all available menu-theme directory names.
+   * @param theme The name of the icon theme's directory.
+   * @returns The absolute path to the icon-theme directory.
    */
-  private async listMenuThemes() {
+  private async findIconThemePath(theme: string) {
     const testPaths = [
-      path.join(app.getPath('userData'), `menu-themes`),
-      path.join(__dirname, `../renderer/assets/menu-themes`),
+      path.join(app.getPath('userData'), 'icon-themes'),
+      path.join(__dirname, '../renderer/assets/icon-themes'),
     ];
 
-    const themes = new Set<string>();
-
     for (const testPath of testPaths) {
+      const themePath = path.join(testPath, theme);
+      const exists = await fs.promises
+        .access(themePath, fs.constants.F_OK)
+        .then(() => true)
+        .catch(() => false);
+
+      if (exists) {
+        return themePath;
+      }
+    }
+
+    console.error(`Icon theme "${theme}" not found. Will look ugly.`);
+
+    return '';
+  }
+
+  /**
+   * This returns a list of all image files in the given directory and its subdirectories.
+   * The paths are relative to the icon theme directory.
+   *
+   * @param directory The directory to search for image files.
+   * @returns A list of all image files in the directory.
+   */
+  private async listIconsRecursively(directory: string) {
+    return new Promise<string[]>((resolve) => {
+      fs.readdir(directory, { withFileTypes: true, recursive: true }, (err, files) => {
+        if (err) {
+          console.error(err);
+          resolve([]);
+          return;
+        }
+
+        // Filter by mimetype to only return image files.
+        files = files.filter((file) => {
+          if (!file.isFile()) {
+            return false;
+          }
+
+          const mimeType = mime.lookup(file.name);
+          return mimeType && mimeType.startsWith('image/');
+        });
+
+        // We return the relative path of the files to the icon theme directory.
+        resolve(
+          files.map((file) => path.relative(directory, path.join(file.path, file.name)))
+        );
+      });
+    });
+  }
+
+  /**
+   * This returns a list of all unique subdirectory names in the given directories. This
+   * is used to find all available menu and icon themes.
+   *
+   * @returns A list of all unique subdirectory names.
+   */
+  private async listSubdirectories(paths: string[]) {
+    const subdirectories = new Set<string>();
+
+    for (const testPath of paths) {
       const exists = await fs.promises
         .access(testPath, fs.constants.F_OK)
         .then(() => true)
         .catch(() => false);
 
       if (exists) {
-        const files = await fs.promises.readdir(testPath, { withFileTypes: true });
+        const files = await fs.promises.readdir(testPath);
         for (const file of files) {
-          if (file.isDirectory()) {
-            themes.add(file.name);
+          const fileInfo = await fs.promises.stat(path.join(testPath, file));
+          if (fileInfo.isDirectory()) {
+            subdirectories.add(file);
           }
         }
       }
     }
 
-    return Array.from(themes);
+    return Array.from(subdirectories);
   }
 
   /**
@@ -1118,10 +1366,57 @@ export class KandoApp {
    * @param theme The name of the menu theme.
    * @returns The description of the menu theme.
    */
-  private async loadMenuDescription(theme: string) {
-    const metaFile = await this.findMenuThemePath(theme);
+  private async loadMenuThemeDescription(theme: string) {
+    let metaFile = await this.findThemePath('menu-themes', theme);
+
+    if (!metaFile) {
+      console.error(`Menu theme "${theme}" not found. Using default theme instead.`);
+      metaFile = path.join(
+        __dirname,
+        `../renderer/assets/menu-themes/default/theme.json5`
+      );
+    }
+
     const content = await fs.promises.readFile(metaFile);
-    const description = json5.parse(content.toString());
+    const description = json5.parse(content.toString()) as IMenuThemeDescription;
+    const directory = path.dirname(metaFile);
+    description.id = path.basename(directory);
+    description.directory = path.dirname(directory);
+    return description;
+  }
+
+  /**
+   * This loads the description of the sound theme with the given name. If the theme is
+   * not found, an empty theme is used instead. In this case, an error message is printed
+   * to the console except for the 'none' theme.
+   *
+   * @param theme The name of the sound theme.
+   * @returns The description of the sound theme.
+   */
+  private async loadSoundThemeDescription(theme: string) {
+    const metaFile = await this.findThemePath('sound-themes', theme);
+
+    if (!metaFile) {
+      if (theme !== 'none') {
+        console.error(`Sound theme "${theme}" not found. No sounds will be played.`);
+      }
+
+      const description: ISoundThemeDescription = {
+        id: 'none',
+        name: 'None',
+        directory: '',
+        engineVersion: 1,
+        themeVersion: '',
+        author: '',
+        license: '',
+        sounds: {},
+      };
+
+      return description;
+    }
+
+    const content = await fs.promises.readFile(metaFile);
+    const description = json5.parse(content.toString()) as ISoundThemeDescription;
     const directory = path.dirname(metaFile);
     description.id = path.basename(directory);
     description.directory = path.dirname(directory);
@@ -1136,15 +1431,77 @@ export class KandoApp {
    * All menu configurations are stored in the `example-menus` directory.
    */
   private createExampleMenu(): IMenu {
+    // To enable localization of the example menus, we need to lookup the strings with
+    // i18next after loading the menu structure from JSON. i18next-parser cannot extract
+    // the strings from JSON files, therefore we have to specify all strings from the
+    // example menus here in a comment. This way, the parser will find them.
+    /*
+    i18next.t('example-menu.name')
+    i18next.t('example-menu.apps.submenu')
+    i18next.t('example-menu.apps.safari')
+    i18next.t('example-menu.apps.web-browser')
+    i18next.t('example-menu.apps.email')
+    i18next.t('example-menu.apps.apple-music')
+    i18next.t('example-menu.apps.gimp')
+    i18next.t('example-menu.apps.paint')
+    i18next.t('example-menu.apps.finder')
+    i18next.t('example-menu.apps.file-browser')
+    i18next.t('example-menu.apps.terminal')
+    i18next.t('example-menu.web-links.submenu')
+    i18next.t('example-menu.web-links.google')
+    i18next.t('example-menu.web-links.kando-on-github')
+    i18next.t('example-menu.web-links.kando-on-kofi')
+    i18next.t('example-menu.web-links.kando-on-youtube')
+    i18next.t('example-menu.web-links.kando-on-discord')
+    i18next.t('example-menu.next-workspace')
+    i18next.t('example-menu.clipboard.submenu')
+    i18next.t('example-menu.clipboard.paste')
+    i18next.t('example-menu.clipboard.copy')
+    i18next.t('example-menu.clipboard.cut')
+    i18next.t('example-menu.audio.submenu')
+    i18next.t('example-menu.audio.next-track')
+    i18next.t('example-menu.audio.play-pause')
+    i18next.t('example-menu.audio.mute')
+    i18next.t('example-menu.audio.previous-track')
+    i18next.t('example-menu.windows.submenu')
+    i18next.t('example-menu.windows.mission-control')
+    i18next.t('example-menu.windows.toggle-maximize')
+    i18next.t('example-menu.windows.tile-right')
+    i18next.t('example-menu.windows.close-window')
+    i18next.t('example-menu.windows.tile-left')
+    i18next.t('example-menu.previous-workspace')
+    i18next.t('example-menu.bookmarks.submenu')
+    i18next.t('example-menu.bookmarks.downloads')
+    i18next.t('example-menu.bookmarks.videos')
+    i18next.t('example-menu.bookmarks.pictures')
+    i18next.t('example-menu.bookmarks.documents')
+    i18next.t('example-menu.bookmarks.desktop')
+    i18next.t('example-menu.bookmarks.home')
+    i18next.t('example-menu.bookmarks.music')
+    */
+
+    let menu: IMenu;
+
     if (process.platform === 'win32') {
-      return require('./example-menus/windows.json');
+      menu = require('./example-menus/windows.json');
+    } else if (process.platform === 'darwin') {
+      menu = require('./example-menus/macos.json');
+    } else {
+      menu = require('./example-menus/linux.json');
     }
 
-    if (process.platform === 'darwin') {
-      return require('./example-menus/macos.json');
-    }
+    const translate = (item: IMenuItem) => {
+      item.name = i18next.t(item.name);
+      if (item.children) {
+        for (const child of item.children) {
+          translate(child);
+        }
+      }
+    };
 
-    return require('./example-menus/linux.json');
+    translate(menu.root);
+
+    return menu;
   }
 
   /**

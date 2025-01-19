@@ -8,12 +8,14 @@
 // SPDX-FileCopyrightText: Simon Schneegans <code@simonschneegans.de>
 // SPDX-License-Identifier: MIT
 
+import i18next from 'i18next';
+
 import { DropTargetTab } from './drop-target-tab';
 import { ToolbarDraggable } from './toolbar-draggable';
 import { IMenu, IMenuItem, deepCopyMenu, deepCopyMenuItem } from '../../../common';
 import { IEditorMenuItem } from '../common/editor-menu-item';
 import { ItemTypeRegistry } from '../../../common/item-type-registry';
-import { IconThemeRegistry } from '../../../common/icon-theme-registry';
+import { IconThemeRegistry } from '../../icon-themes/icon-theme-registry';
 import { IDraggable } from '../common/draggable';
 import { DnDManager } from '../common/dnd-manager';
 
@@ -95,9 +97,10 @@ export class TrashTab extends DropTargetTab {
           name: menu.root.name,
           description:
             (this.showShortcutIDs ? menu.shortcutID : menu.shortcut) || 'Not bound.',
-          icon: IconThemeRegistry.getInstance()
-            .getTheme(menu.root.iconTheme)
-            .createDiv(menu.root.icon).outerHTML,
+          icon: IconThemeRegistry.getInstance().createIcon(
+            menu.root.iconTheme,
+            menu.root.icon
+          ).outerHTML,
           index,
         };
       }
@@ -109,9 +112,8 @@ export class TrashTab extends DropTargetTab {
         isMenu: false,
         name: item.name,
         description: typeInfo?.getDescription(item),
-        icon: IconThemeRegistry.getInstance()
-          .getTheme(item.iconTheme)
-          .createDiv(item.icon).outerHTML,
+        icon: IconThemeRegistry.getInstance().createIcon(item.iconTheme, item.icon)
+          .outerHTML,
         index,
       };
     });
@@ -120,8 +122,8 @@ export class TrashTab extends DropTargetTab {
     const template = require('./templates/templates-trash-tab.hbs');
     this.tabContent.innerHTML = template({
       type: 'trash',
-      placeholderHeading: 'You can delete menus and menu items by dropping them here!',
-      placeholderSubheading: 'When you restart Kando, they will be gone.',
+      placeholderHeading: i18next.t('toolbar.trash-tab.heading'),
+      placeholderSubheading: i18next.t('toolbar.trash-tab.subheading'),
       items: data,
     });
 

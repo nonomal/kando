@@ -10,6 +10,8 @@
 
 import { app } from 'electron';
 import { program } from 'commander';
+import i18next from 'i18next';
+import i18Backend from 'i18next-fs-backend/cjs';
 
 /**
  * This file is the main entry point for Kando's host process. It is responsible for
@@ -30,6 +32,10 @@ interface CLIOptions {
   // This optional parameter is specified using the --reload-menu-theme option. It is used
   // to reload the current menu theme from disk.
   reloadMenuTheme?: boolean;
+
+  // This optional parameter is specified using the --reload-sound-theme option. It is
+  // used to reload the current sound theme from disk.
+  reloadSoundTheme?: boolean;
 }
 
 // Handle creating/removing shortcuts on Windows when installing/uninstalling.
@@ -46,7 +52,9 @@ program
   .option('-m, --menu <menu>', 'show the menu with the given name')
   .option('-s, --settings', 'show the menu editor')
   .option('--reload-menu-theme', 'reload the current menu theme from disk')
-  .allowUnknownOption(true);
+  .option('--reload-sound-theme', 'reload the current sound theme from disk')
+  .allowUnknownOption(true)
+  .allowExcessArguments(true);
 
 program.parse();
 const options = program.opts() as CLIOptions;
@@ -107,6 +115,27 @@ const handleCommandLine = (options: CLIOptions) => {
 
 app
   .whenReady()
+  .then(() => {
+    return i18next.use(i18Backend).init({
+      lng: app.getLocale(),
+      fallbackLng: {
+        /* eslint-disable @typescript-eslint/naming-convention */
+        'en-US': ['en'],
+        'en-GB': ['en'],
+        'de-DE': ['de', 'en'],
+        'de-CH': ['de', 'en'],
+        'de-AT': ['de', 'en'],
+        'zh-CN': ['zh-Hans', 'en'],
+        zh: ['zh-Hans', 'en'],
+        pt: ['pt-BR', 'en'],
+        /* eslint-enable @typescript-eslint/naming-convention */
+        default: ['en'],
+      },
+      backend: {
+        loadPath: path.join(__dirname, 'locales/{{lng}}/{{ns}}.json'),
+      },
+    });
+  })
   .then(() => kando.init())
   .then(() => {
     // Save some settings when the app is closed.
@@ -122,12 +151,9 @@ app
 
     // Show the menu passed via --menu when a second instance is started.
     app.on('second-instance', (e, argv, pwd, options: CLIOptions) => {
-      // If no option was passed, we show a notification to the user.
+      // If no option was passed, we show the settings.
       if (!handleCommandLine(options)) {
-        KandoApp.showError(
-          'Kando is already running',
-          'Check the system tray icon for some options!'
-        );
+        kando.showEditor();
       }
     });
 
@@ -138,7 +164,7 @@ app
     handleCommandLine(options);
   })
   .catch((error) => {
-    KandoApp.showError('Kando failed to start', error.message);
+    KandoApp.showError(i18next.t('main.failed-to-start-header'), error.message);
     app.quit();
     process.exitCode = 1;
   });

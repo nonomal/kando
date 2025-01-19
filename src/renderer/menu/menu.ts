@@ -11,16 +11,90 @@
 import { EventEmitter } from 'events';
 
 import * as math from '../math';
-import { IShowMenuOptions, IVec2 } from '../../common';
+import { IShowMenuOptions, IVec2, SoundType } from '../../common';
 import { IRenderedMenuItem } from './rendered-menu-item';
 import { CenterText } from './center-text';
-import { GestureDetection } from './gesture-detection';
-import { InputState, InputTracker } from './input-tracker';
+import { GamepadInput } from './input-methods/gamepad-input';
+import { PointerInput } from './input-methods/pointer-input';
+import { ButtonState, IInputState, SelectionType } from './input-methods/input-method';
 import { MenuTheme } from './menu-theme';
+import { SoundTheme } from './sound-theme';
 import { closestEquivalentAngle } from '../math';
 
-const CENTER_RADIUS = 50;
-const PARENT_DISTANCE = 150;
+/** These options can be given to the constructor of the menu. */
+export class MenuOptions {
+  /** Clicking inside this radius will select the parent element. */
+  centerDeadZone = 50;
+
+  /**
+   * The distance in pixels at which the parent menu item is placed if a submenu is
+   * selected close to the parent.
+   */
+  minParentDistance = 150;
+
+  /**
+   * This is the threshold in pixels which is used to differentiate between a click and a
+   * drag. If the mouse is moved more than this threshold before the mouse button is
+   * released, an item is dragged.
+   */
+  dragThreshold = 15;
+
+  /** The time in milliseconds it takes to fade in the menu. */
+  fadeInDuration = 150;
+
+  /** The time in milliseconds it takes to fade out the menu. */
+  fadeOutDuration = 200;
+
+  /** If enabled, items can be selected by dragging the mouse over them. */
+  enableMarkingMode = true;
+
+  /**
+   * If enabled, items can be selected by hovering over them while holding down a keyboard
+   * key.
+   */
+  enableTurboMode = true;
+
+  /** Shorter gestures will not lead to selections. */
+  gestureMinStrokeLength = 150;
+
+  /** Smaller turns will not lead to selections. */
+  gestureMinStrokeAngle = 20;
+
+  /** Smaller movements will not be considered. */
+  gestureJitterThreshold = 10;
+
+  /**
+   * If the pointer is stationary for this many milliseconds, the current item will be
+   * selected.
+   */
+  gesturePauseTimeout = 100;
+
+  /**
+   * If set to a value greater than 0, items will be instantly selected if the mouse
+   * travelled more than centerDeadZone + fixedStrokeLength pixels in marking or turbo
+   * mode. Any other gesture detection based on angles or motion speed will be disabled in
+   * this case.
+   */
+  fixedStrokeLength = 0;
+
+  /**
+   * If enabled, the parent of a selected item will be selected on a right mouse button
+   * click. Else the menu will be closed directly.
+   */
+  rmbSelectsParent = false;
+
+  /**
+   * This button will select the parent item when using a gamepad. Set to -1 to disable.
+   * See https://w3c.github.io/gamepad/#remapping for the mapping of numbers to buttons.
+   */
+  gamepadBackButton = 1;
+
+  /**
+   * This button will close the menu when using a gamepad. Set to -1 to disable. See
+   * https://w3c.github.io/gamepad/#remapping for the mapping of numbers to buttons.
+   */
+  gamepadCloseButton = 2;
+}
 
 /**
  * The menu is the main class of Kando. It stores a tree of items which is used to render
@@ -54,10 +128,16 @@ export class Menu extends EventEmitter {
   private root: IRenderedMenuItem = null;
 
   /**
+   * This holds some global options for the menu. These options can be set when the menu
+   * is created and will be used to configure the menu's behavior.
+   */
+  private options: MenuOptions = null;
+
+  /**
    * This holds some information which is passed to the menu when it is shown from the
    * main process. For instance, it holds the window size and the initial mouse position.
    */
-  private options: IShowMenuOptions;
+  private showMenuOptions: IShowMenuOptions;
 
   /**
    * The hovered item is the menu item which is currently hovered by the mouse. It is used
@@ -86,14 +166,23 @@ export class Menu extends EventEmitter {
   /** This shows the name of the currently hovered child on the center item. */
   private centerText: CenterText = null;
 
-  /** The gesture detection is used to detect item selections in marking mode. */
-  private gestures: GestureDetection = new GestureDetection();
+  /** This detects mouse and touch gestures and emits selection events. */
+  private pointerInput: PointerInput = new PointerInput();
 
   /**
-   * This object contains all information on the current mouse state. Is it updated
-   * whenever the mouse is moved or a button is pressed.
+   * The gamepad input is used to detect gamepad input. It polls the gamepad state and
+   * emits events when buttons are pressed or the thumbsticks are moved.
    */
-  private input: InputTracker = new InputTracker();
+  private gamepadInput: GamepadInput = new GamepadInput();
+
+  /**
+   * This object contains information on the latest pointer state. Is it updated whenever
+   * an input pointer is moved.
+   */
+  private latestInput: IInputState = null;
+
+  /** This timeout is used to clear the menu div after the fade-out animation. */
+  private hideTimeout: NodeJS.Timeout;
 
   /**
    * The constructor will attach event listeners to the given container element. It will
@@ -101,159 +190,24 @@ export class Menu extends EventEmitter {
    *
    * @param container The HTML element which contains the menu.
    * @param theme The theme to use for rendering the menu.
+   * @param soundTheme The theme to use for playing sounds.
+   * @param options Use this to tweak the behavior of the menu.
    */
   constructor(
     private container: HTMLElement,
-    private theme: MenuTheme
+    private theme: MenuTheme,
+    private soundTheme: SoundTheme,
+    options: Partial<MenuOptions> = {}
   ) {
     super();
 
     this.container = container;
 
-    // When the mouse is moved, we store the absolute mouse position, as well as the mouse
-    // position, distance, and angle relative to the currently selected item.
-    const onMotionEvent = (event: MouseEvent | TouchEvent) => {
-      event.preventDefault();
-      event.stopPropagation();
+    // Use the default options and overwrite them with the given options.
+    this.setOptions({ ...new MenuOptions(), ...options });
 
-      this.input.onMotionEvent(event, this.getCenterItemPosition());
-    };
-
-    // When the left mouse button is pressed, the currently hovered item becomes the
-    // dragged item.
-    const onPointerDownEvent = (event: MouseEvent | TouchEvent) => {
-      event.preventDefault();
-      event.stopPropagation();
-
-      // Hide the menu on right click events.
-      if ((event as MouseEvent).button === 2) {
-        this.emit('cancel');
-        return;
-      }
-
-      this.redraw();
-
-      this.input.onPointerDownEvent(event, this.getCenterItemPosition());
-      this.gestures.reset();
-    };
-
-    // When the left mouse button is released, the currently dragged item is selected.
-    const onPointerUpEvent = (event: MouseEvent | TouchEvent) => {
-      event.preventDefault();
-      event.stopPropagation();
-
-      // Ignore right mouse button events.
-      if ((event as MouseEvent).button === 2) {
-        return;
-      }
-
-      // Hide the menu if we clicked the center of the root menu.
-      if (
-        this.input.state === InputState.eClicked &&
-        this.selectionChain.length === 1 &&
-        this.input.distance < CENTER_RADIUS
-      ) {
-        this.emit('cancel');
-        return;
-      }
-
-      this.input.onPointerUpEvent();
-      this.gestures.reset();
-
-      if (this.draggedItem || this.clickedItem) {
-        this.selectItem(this.draggedItem || this.clickedItem);
-      }
-    };
-
-    this.container.addEventListener('mousedown', onPointerDownEvent);
-    this.container.addEventListener('mousemove', onMotionEvent);
-    this.container.addEventListener('mouseup', onPointerUpEvent);
-    this.container.addEventListener('touchstart', onPointerDownEvent);
-    this.container.addEventListener('touchmove', onMotionEvent);
-    this.container.addEventListener('touchend', onPointerUpEvent);
-
-    // In order to keep track of any pressed key for the turbo mode, we listen to keydown
-    // and keyup events.
-    document.addEventListener('keydown', (event) => {
-      const anyModifierPressed =
-        event.ctrlKey || event.metaKey || event.shiftKey || event.altKey;
-      const menuKeys = '0123456789abcdefghijklmnopqrstuvwxyz';
-      if (!anyModifierPressed && menuKeys.includes(event.key)) {
-        const index = menuKeys.indexOf(event.key);
-        if (index === 0) {
-          if (this.selectionChain.length > 1) {
-            this.selectItem(this.selectionChain[this.selectionChain.length - 2]);
-          } else {
-            this.emit('cancel');
-          }
-        } else {
-          const currentItem = this.selectionChain[this.selectionChain.length - 1];
-          if (currentItem.children) {
-            const child = currentItem.children[index - 1];
-            if (child) {
-              this.selectItem(child);
-            }
-          }
-        }
-      } else if (event.key !== 'Escape') {
-        this.input.onKeyDownEvent();
-      }
-    });
-
-    // If the last modifier is released while a menu item is dragged around, we select it.
-    // This enables selections in "Turbo-Mode", where items can be selected with mouse
-    // movements without pressing the left mouse button but by holding a keyboard key
-    // instead.
-    document.addEventListener('keyup', (event) => {
-      if (event.key === 'Escape') {
-        return;
-      }
-
-      const wasTurboMode = this.input.turboMode;
-
-      this.input.onKeyUpEvent(event);
-
-      if (wasTurboMode) {
-        const stillAnyModifierPressed =
-          event.ctrlKey || event.metaKey || event.shiftKey || event.altKey;
-
-        if (!stillAnyModifierPressed) {
-          this.gestures.reset();
-          if (this.draggedItem) {
-            this.selectItem(this.draggedItem);
-          }
-        }
-      }
-    });
-
-    // If the mouse pointer (or a modifier key) is held down, forward the motion event
-    // to the gesture selection.
-    this.input.on('pointer-motion', (coords: IVec2, dragged: boolean) => {
-      if (dragged) {
-        this.gestures.onMotionEvent(coords);
-      }
-      this.redraw();
-    });
-
-    // This will be fed with motion events. If the pointer makes a turn or is stationary
-    // for some time, a selection event will be emitted.
-    this.gestures.on('selection', (coords: IVec2) => {
-      // If there is an item currently dragged, select it. We only select items which have
-      // children in marking mode in order to prevent unwanted actions. This way the user
-      // can always check if the correct action was selected before executing it.
-      if (
-        !this.options.anchoredMode &&
-        this.draggedItem &&
-        this.draggedItem.children?.length > 0
-      ) {
-        // The selection event reports where the selection most likely occurred (e.g. the
-        // position where the mouse pointer actually made a turn). We pretend that the
-        // mouse pointer is currently at that position, so that the newly selected item
-        // will be moved to this position.
-        this.input.update(coords, this.getCenterItemPosition());
-        this.selectItem(this.draggedItem);
-      }
-    });
+    // Initialize the input devices.
+    this.initializeInput();
   }
 
   /**
@@ -261,39 +215,72 @@ export class Menu extends EventEmitter {
    * given root item and all its children. It will also set up the angles and positions of
    * all items and show the menu.
    *
-   * @param options Some additional information on how to show the menu.
+   * @param showMenuOptions Some additional information on how to show the menu.
    */
-  public show(root: IRenderedMenuItem, options: IShowMenuOptions) {
+  public show(root: IRenderedMenuItem, showMenuOptions: IShowMenuOptions) {
+    // Cancel any ongoing hiding.
+    if (this.hideTimeout) {
+      clearTimeout(this.hideTimeout);
+      this.hideTimeout = null;
+    }
+
     this.clear();
 
-    this.options = options;
+    this.showMenuOptions = showMenuOptions;
 
-    this.input.deferredTurboMode = options.centeredMode;
-    this.input.update(this.getInitialMenuPosition());
-    this.input.ignoreNextMotionEvents();
+    // If the pointer is not warped to the center of the menu, we should not enter
+    // turbo-mode right away.
+    if (!showMenuOptions.warpMouse && showMenuOptions.centeredMode) {
+      this.pointerInput.deferTurboMode();
+    }
+
+    // On some wayland compositors (for instance KWin), one or two initial mouse motion
+    // events are sent containing wrong coordinates. They seem to be the coordinates of
+    // the last mouse motion event over any XWayland surface before Kando's window was
+    // opened. We simply ignore these events. This code is currently used on all platforms
+    // but I think it's not an issue. Instead, we pass the initial menu position as a
+    // first motion event to the input tracker.
+    this.pointerInput.ignoreNextMotionEvents();
+
+    // In anchored mode, we have to disable turbo and marking mode.
+    this.pointerInput.enableMarkingMode =
+      this.options.enableMarkingMode && !showMenuOptions.anchoredMode;
+    this.pointerInput.enableTurboMode =
+      this.options.enableTurboMode && !showMenuOptions.anchoredMode;
 
     this.root = root;
     this.setupPaths(this.root);
     this.setupAngles(this.root);
     this.createNodeTree(this.root, this.container);
-    this.selectItem(this.root);
+    this.selectItem(this.root, this.getInitialMenuPosition());
+
+    // If required, move the pointer to the center of the menu.
+    if (showMenuOptions.warpMouse && showMenuOptions.centeredMode) {
+      const offset = math.subtract(
+        this.getInitialMenuPosition(),
+        showMenuOptions.mousePosition
+      );
+      this.emit('move-pointer', offset);
+    }
 
     // Finally, show the menu.
     this.container.classList.remove('hidden');
+
+    // Play the open sound.
+    this.soundTheme.playSound(SoundType.eOpenMenu);
   }
 
   /** Hides the menu. */
   public hide() {
     this.container.classList.add('hidden');
+    this.hideTimeout = setTimeout(() => {
+      this.clear();
+    }, this.options.fadeOutDuration);
   }
 
   /** Removes all DOM elements from the menu and resets the root menu item. */
   public clear() {
     this.container.className = 'hidden';
-
-    this.gestures.reset();
-    this.input.onPointerUpEvent();
-
     this.container.innerHTML = '';
     this.root = null;
     this.centerText = null;
@@ -302,7 +289,175 @@ export class Menu extends EventEmitter {
     this.selectionChain = [];
   }
 
+  /**
+   * Allow changing the options at run-time.
+   *
+   * @param options The new options.
+   */
+  public setOptions(options: Partial<MenuOptions>) {
+    this.options = { ...this.options, ...options };
+
+    this.container.style.setProperty(
+      '--fade-in-duration',
+      `${this.options.fadeInDuration}ms`
+    );
+
+    this.container.style.setProperty(
+      '--fade-out-duration',
+      `${this.options.fadeOutDuration}ms`
+    );
+
+    this.pointerInput.enableMarkingMode = this.options.enableMarkingMode;
+    this.pointerInput.enableTurboMode = this.options.enableTurboMode;
+    this.pointerInput.dragThreshold = this.options.dragThreshold;
+
+    this.pointerInput.gestureDetector.minStrokeLength =
+      this.options.gestureMinStrokeLength;
+    this.pointerInput.gestureDetector.minStrokeAngle = this.options.gestureMinStrokeAngle;
+    this.pointerInput.gestureDetector.jitterThreshold =
+      this.options.gestureJitterThreshold;
+    this.pointerInput.gestureDetector.pauseTimeout = this.options.gesturePauseTimeout;
+    this.pointerInput.gestureDetector.fixedStrokeLength = this.options.fixedStrokeLength;
+    this.pointerInput.gestureDetector.centerDeadZone = this.options.centerDeadZone;
+
+    this.gamepadInput.parentDistance = this.options.minParentDistance;
+    this.gamepadInput.backButton = this.options.gamepadBackButton;
+    this.gamepadInput.closeButton = this.options.gamepadCloseButton;
+  }
+
   // --------------------------------------------------------------------- private methods
+
+  /**
+   * This method initializes the input devices. It attaches event listeners to the input
+   * devices and sets up the gesture detection.
+   */
+  private initializeInput() {
+    const onCloseMenu = () => {
+      if (this.options.rmbSelectsParent) {
+        this.selectParent();
+      } else {
+        this.cancelHide();
+      }
+    };
+
+    const onUpdateState = (state: IInputState) => {
+      this.latestInput = state;
+      this.redraw();
+    };
+
+    const onSelection = (coords: IVec2, type: SelectionType) => {
+      // Ignore all input if the menu is in the process of hiding.
+      if (this.container.classList.contains('hidden')) {
+        return;
+      }
+
+      if (type === SelectionType.eParent) {
+        this.selectParent(coords);
+        return;
+      }
+
+      // If there is an item currently dragged, select it. If we are in Marking Mode or
+      // Turbo Mode, the selection type will be eSubmenuOnly. In this case, we only select
+      // subemnus in order to prevent unwanted actions. This way the user can always check
+      // if the correct action was selected before executing it.
+      // We also do not trigger selections of the parent item when moving the mouse in the
+      // center zone of the menu. This feels more natural and prevents accidental
+      // selections.
+      const item = this.hoveredItem || this.clickedItem || this.draggedItem;
+      if (
+        type === SelectionType.eSubmenuOnly &&
+        item &&
+        item.type === 'submenu' &&
+        this.latestInput.distance > this.options.centerDeadZone
+      ) {
+        this.selectItem(item, coords);
+        return;
+      }
+
+      // If there is a clicked item, select it. If the clicked item is the root item, the
+      // menu will be closed.
+      if (type === SelectionType.eActiveItem && item) {
+        if (this.selectionChain.length === 1 && item === this.root) {
+          this.cancelHide();
+        } else {
+          this.selectItem(item, coords);
+        }
+        return;
+      }
+    };
+
+    this.pointerInput.onCloseMenu(onCloseMenu);
+    this.gamepadInput.onCloseMenu(onCloseMenu);
+
+    this.pointerInput.onUpdateState(onUpdateState);
+    this.gamepadInput.onUpdateState(onUpdateState);
+
+    this.pointerInput.onSelection(onSelection);
+    this.gamepadInput.onSelection(onSelection);
+
+    document.addEventListener('keydown', (event) => {
+      if (this.container.classList.contains('hidden')) {
+        return;
+      }
+
+      const anyModifierPressed =
+        event.ctrlKey || event.metaKey || event.shiftKey || event.altKey;
+      const menuKeys = '0123456789abcdefghijklmnopqrstuvwxyz';
+      if (!anyModifierPressed && event.key === 'Backspace') {
+        this.selectParent();
+      } else if (!anyModifierPressed && menuKeys.includes(event.key)) {
+        const index = menuKeys.indexOf(event.key);
+        if (index === 0) {
+          this.selectParent();
+        } else {
+          const currentItem = this.selectionChain[this.selectionChain.length - 1];
+          if (currentItem.children) {
+            const child = currentItem.children[index - 1];
+            if (child) {
+              this.selectItem(child, this.getCenterItemPosition());
+            }
+          }
+        }
+      } else if (event.key !== 'Escape') {
+        this.pointerInput.onKeyDownEvent();
+      }
+    });
+
+    // If the last modifier is released while a menu item is dragged around, we select it.
+    // This enables selections in "Turbo-Mode", where items can be selected with mouse
+    // movements without pressing the left mouse button but by holding a keyboard key
+    // instead.
+    document.addEventListener('keyup', (event) => {
+      if (this.container.classList.contains('hidden')) {
+        return;
+      }
+
+      if (event.key === 'Escape') {
+        return;
+      }
+
+      this.pointerInput.onKeyUpEvent(event);
+    });
+
+    this.container.addEventListener('mousedown', (e) =>
+      this.pointerInput.onPointerDownEvent(e)
+    );
+    this.container.addEventListener('mousemove', (e) =>
+      this.pointerInput.onMotionEvent(e)
+    );
+    this.container.addEventListener('mouseup', (e) =>
+      this.pointerInput.onPointerUpEvent(e)
+    );
+    this.container.addEventListener('touchstart', (e) =>
+      this.pointerInput.onPointerDownEvent(e)
+    );
+    this.container.addEventListener('touchmove', (e) =>
+      this.pointerInput.onMotionEvent(e)
+    );
+    this.container.addEventListener('touchend', (e) =>
+      this.pointerInput.onPointerUpEvent(e)
+    );
+  }
 
   /**
    * This method creates the DOM tree for the given menu item and all its children. For
@@ -380,11 +535,18 @@ export class Menu extends EventEmitter {
       }
 
       if (item === this.root) {
-        const maxCenterTextSize = CENTER_RADIUS * 2.0;
-        const padding = CENTER_RADIUS * 0.1;
-        this.centerText = new CenterText(rootContainer, maxCenterTextSize - padding);
+        this.centerText = new CenterText(rootContainer, this.theme.centerTextWrapWidth);
       }
     }
+  }
+
+  /**
+   * This method closes the menu in case the selection should be canceled. This should be
+   * called if nothing is selected but the menu should be closed.
+   */
+  private cancelHide() {
+    this.soundTheme.playSound(SoundType.eCloseMenu);
+    this.emit('cancel');
   }
 
   /**
@@ -398,8 +560,10 @@ export class Menu extends EventEmitter {
    * If the given item is a leaf item, the "select" event is emitted.
    *
    * @param item The newly selected menu item.
+   * @param coords The position where the selection most likely happened. If it is not
+   *   given, the latest pointer input position is used.
    */
-  private selectItem(item: IRenderedMenuItem) {
+  private selectItem(item: IRenderedMenuItem, coords?: IVec2) {
     this.clickItem(null);
     this.hoverItem(null);
     this.dragItem(null);
@@ -415,43 +579,6 @@ export class Menu extends EventEmitter {
     // Is the item the parent of the currently active item?
     const selectedParent = this.isParentOfCenterItem(item);
 
-    // Now we have to position the root element of the menu at a position so that the
-    // newly selected menu item is at the mouse position. For this, we first compute ideal
-    // position of the new item based on its angle and the mouse distance to the currently
-    // center. There is the special case where we select the root item. In this case, we
-    // simply position the root element at the mouse position.
-    if (item === this.root) {
-      this.root.position = this.options.anchoredMode
-        ? this.getInitialMenuPosition()
-        : this.input.absolutePosition;
-    } else if (selectedParent) {
-      const center = this.selectionChain[this.selectionChain.length - 1];
-
-      if (this.options.anchoredMode) {
-        this.root.position = math.add(this.root.position, center.position);
-      } else {
-        const offset = math.add(this.input.relativePosition, center.position);
-        this.root.position = math.add(this.root.position, offset);
-      }
-    } else {
-      // Compute the ideal position of the new item. The distance to the parent item is
-      // set to be at least PARENT_DISTANCE. This is to avoid that the menu is
-      // too close to the parent item. In anchored mode, the distance is set to
-      // PARENT_DISTANCE.
-      const distance = this.options.anchoredMode
-        ? PARENT_DISTANCE
-        : Math.max(PARENT_DISTANCE, this.input.distance);
-
-      item.position = math.getDirection(item.angle, distance);
-
-      if (this.options.anchoredMode) {
-        this.root.position = math.subtract(this.root.position, item.position);
-      } else {
-        const offset = math.subtract(this.input.relativePosition, item.position);
-        this.root.position = math.add(this.root.position, offset);
-      }
-    }
-
     // If the menu item is the parent of the currently selected item, we have to pop the
     // currently selected item from the list of selected menu items. If the item is a
     // child of the currently selected item, we have to push it to the list of selected
@@ -462,14 +589,57 @@ export class Menu extends EventEmitter {
       this.selectionChain.push(item);
     }
 
-    // Clamp the position of the newly selected submenu to the viewport.
-    if (item.children?.length > 0) {
+    // Now we have to position the root element of the menu at a position so that the
+    // newly selected menu item is at the mouse position or at the given coordinates (if
+    // any is provided). For this, we first compute ideal position of the new item based
+    // on its angle and the mouse distance to the current center. There is the special
+    // case where we selected the root item. In this case, we simply position the root
+    // element at the mouse position.
+    if (item === this.root) {
+      this.root.position = this.showMenuOptions.anchoredMode
+        ? this.getInitialMenuPosition()
+        : coords || this.latestInput.absolutePosition;
+    } else {
+      // First we compute the distance to the parent item. In anchored mode, the distance
+      // is set to this.options.minParentDistance. If a parent was selected, we keep the
+      // original offset, if a child was selected, we use the latest input distance.
+      let distance = this.options.minParentDistance;
+
+      if (!this.showMenuOptions.anchoredMode) {
+        if (selectedParent) {
+          distance = math.getLength(item.position);
+        } else {
+          distance = Math.max(this.options.minParentDistance, this.latestInput.distance);
+        }
+      }
+
+      // Compute the item's position based on its angle the computed distance.
+      item.position = math.getDirection(item.angle, distance);
+
+      // Now we want to move the root item so that the newly selected item is at the given
+      // coordinates or at the mouse position. In anchored mode we want to always use the
+      // initial menu position.
+      let targetAbsolutePosition = { x: 0, y: 0 };
+
+      if (this.showMenuOptions.anchoredMode) {
+        targetAbsolutePosition = this.getInitialMenuPosition();
+      } else {
+        targetAbsolutePosition = coords || this.latestInput.absolutePosition;
+      }
+
+      const offset = math.subtract(targetAbsolutePosition, this.getCenterItemPosition());
+      this.root.position = math.add(this.root.position, offset);
+    }
+
+    // Clamp the position of the newly selected submenu to the viewport. We warp the mouse
+    // pointer if the menu is shifted.
+    if (item.type === 'submenu') {
       const position = this.getCenterItemPosition();
 
       const clampedPosition = math.clampToMonitor(
         position,
         this.theme.maxMenuRadius,
-        this.options.windowSize
+        this.showMenuOptions.windowSize
       );
 
       const offset = {
@@ -478,13 +648,30 @@ export class Menu extends EventEmitter {
       };
 
       if (offset.x !== 0 || offset.y !== 0) {
-        this.emit('move-pointer', offset);
+        if (!this.showMenuOptions.anchoredMode) {
+          this.emit('move-pointer', offset);
+        }
+
         this.root.position = math.add(this.root.position, offset);
       }
+
+      // Update the mouse info based on the newly selected item's position.
+      this.pointerInput.setCurrentCenter(clampedPosition, this.options.centerDeadZone);
+      this.gamepadInput.setCurrentCenter(clampedPosition);
     }
 
-    // Update the mouse info based on the newly selected item's position.
-    this.input.update(this.input.absolutePosition);
+    // Choose a sound effect to play. We do not play a sound effect for the initial
+    // selection of the root item.
+    if (item !== this.root || selectedParent) {
+      let soundType = SoundType.eSelectItem;
+      if (item.type === 'submenu') {
+        soundType = SoundType.eSelectSubmenu;
+      }
+      if (selectedParent) {
+        soundType = SoundType.eSelectParent;
+      }
+      this.soundTheme.playSound(soundType);
+    }
 
     // Finally update the CSS classes of all DOM nodes according to the new selection chain
     // and update the connectors.
@@ -499,6 +686,22 @@ export class Menu extends EventEmitter {
   }
 
   /**
+   * This method will select the parent of the currently selected item. If the currently
+   * selected item is the root item, the "cancel" event will be emitted.
+   *
+   * @param coords The position where the selection most likely happened. If it is not
+   *   given, the latest pointer input position is used.
+   */
+  private selectParent(coords?: IVec2) {
+    if (this.selectionChain.length > 1) {
+      this.soundTheme.playSound(SoundType.eSelectParent);
+      this.selectItem(this.selectionChain[this.selectionChain.length - 2], coords);
+    } else {
+      this.cancelHide();
+    }
+  }
+
+  /**
    * This will assign the CSS class 'hovered' to the given menu item's node div element.
    * It will also remove the class from the previously hovered menu item.
    *
@@ -507,6 +710,23 @@ export class Menu extends EventEmitter {
   private hoverItem(item?: IRenderedMenuItem) {
     if (this.hoveredItem === item) {
       return;
+    }
+
+    // Choose the sound effect to play. We only play a sound if a new item is hovered and
+    // if there was a previously hovered item. This ensures that no hover effect is played
+    // when we enter a submenu - i this case the previously hovered item is null.
+    if (item && this.hoveredItem !== null) {
+      let soundType = SoundType.eHoverItem;
+
+      if (item.type === 'submenu') {
+        soundType = SoundType.eHoverSubmenu;
+      }
+
+      if (this.isParentOfCenterItem(item)) {
+        soundType = SoundType.eHoverParent;
+      }
+
+      this.soundTheme.playSound(soundType);
     }
 
     if (this.hoveredItem) {
@@ -604,16 +824,16 @@ export class Menu extends EventEmitter {
       this.dragItem(this.hoveredItem);
     }
 
-    if (this.input.state === InputState.eClicked && !this.clickedItem) {
+    if (this.latestInput.button === ButtonState.eClicked && !this.clickedItem) {
       this.clickItem(this.hoveredItem);
       this.updateConnectors();
     }
 
     // If the mouse is dragged over a menu item, make that item the dragged item.
     if (
-      this.input.state === InputState.eDragging &&
+      this.latestInput.button === ButtonState.eDragged &&
       !this.draggedItem &&
-      this.input.distance > CENTER_RADIUS &&
+      this.latestInput.distance > this.options.centerDeadZone &&
       this.hoveredItem
     ) {
       this.dragItem(this.hoveredItem);
@@ -622,22 +842,22 @@ export class Menu extends EventEmitter {
     // Abort item-dragging when dragging the item over the center of the currently active
     // menu.
     if (
-      this.input.state === InputState.eDragging &&
+      this.latestInput.button === ButtonState.eDragged &&
       this.draggedItem &&
-      this.input.distance < CENTER_RADIUS
+      this.latestInput.distance < this.options.centerDeadZone
     ) {
       this.dragItem(null);
       this.updateConnectors();
     }
 
     // Abort item dragging if the mouse button was released.
-    if (this.input.state === InputState.eReleased && this.draggedItem) {
+    if (this.latestInput.button === ButtonState.eReleased && this.draggedItem) {
       this.dragItem(null);
       this.updateConnectors();
     }
 
     // Un-click an item if mouse button was released.
-    if (this.input.state === InputState.eReleased && this.clickedItem) {
+    if (this.latestInput.button === ButtonState.eReleased && this.clickedItem) {
       this.clickItem(null);
       this.updateConnectors();
     }
@@ -663,7 +883,7 @@ export class Menu extends EventEmitter {
   private computeHoveredItem(): IRenderedMenuItem {
     // If the mouse is in the center of the menu, return the parent of the currently
     // selected item.
-    if (this.input.distance < CENTER_RADIUS) {
+    if (this.latestInput.distance < this.options.centerDeadZone) {
       if (this.selectionChain.length > 1) {
         return this.selectionChain[this.selectionChain.length - 2];
       }
@@ -675,7 +895,9 @@ export class Menu extends EventEmitter {
     const currentItem = this.selectionChain[this.selectionChain.length - 1];
     if (currentItem.children) {
       for (const child of currentItem.children as IRenderedMenuItem[]) {
-        if (math.isAngleBetween(this.input.angle, child.startAngle, child.endAngle)) {
+        if (
+          math.isAngleBetween(this.latestInput.angle, child.startAngle, child.endAngle)
+        ) {
           return child;
         }
       }
@@ -710,20 +932,23 @@ export class Menu extends EventEmitter {
 
         this.theme.setCenterProperties(
           item,
-          this.input.angle,
+          this.latestInput.angle,
           hoveredAngle,
           this.isParentOfCenterItem(this.hoveredItem)
         );
 
         for (let j = 0; j < item.children?.length; ++j) {
           const child = item.children[j] as IRenderedMenuItem;
-          if (child === this.draggedItem && this.input.state === InputState.eDragging) {
-            child.position = this.input.relativePosition;
+          if (
+            child === this.draggedItem &&
+            this.latestInput.button === ButtonState.eDragged
+          ) {
+            child.position = this.latestInput.relativePosition;
             child.nodeDiv.style.transform = `translate(${child.position.x}px, ${child.position.y}px)`;
           } else {
             // Set the custom CSS properties of the item, like the angular difference between
             // the item and the mouse pointer direction.
-            this.theme.setChildProperties(child, this.input.angle);
+            this.theme.setChildProperties(child, this.latestInput.angle);
             child.nodeDiv.style.transform = '';
             delete child.position;
           }
@@ -947,13 +1172,13 @@ export class Menu extends EventEmitter {
    * @returns The initial position of the root item.
    */
   private getInitialMenuPosition() {
-    return {
-      x: this.options.centeredMode
-        ? (this.options.windowSize.x / this.options.zoomFactor) * 0.5
-        : this.options.mousePosition.x,
-      y: this.options.centeredMode
-        ? (this.options.windowSize.y / this.options.zoomFactor) * 0.5
-        : this.options.mousePosition.y,
-    };
+    if (this.showMenuOptions.centeredMode) {
+      return {
+        x: (this.showMenuOptions.windowSize.x / this.showMenuOptions.zoomFactor) * 0.5,
+        y: (this.showMenuOptions.windowSize.y / this.showMenuOptions.zoomFactor) * 0.5,
+      };
+    }
+
+    return this.showMenuOptions.mousePosition;
   }
 }

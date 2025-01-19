@@ -8,6 +8,7 @@
 // SPDX-FileCopyrightText: Simon Schneegans <code@simonschneegans.de>
 // SPDX-License-Identifier: MIT
 
+import i18next from 'i18next';
 import { exec } from 'child_process';
 import { WLRBackend } from '../wlroots/backend';
 import { native } from './native';
@@ -28,7 +29,7 @@ export class HyprBackend extends WLRBackend {
       `
 The Hyprland backend is still a bit experimental!
 You have to perform some manual steps to make Kando work properly.
-See https://github.com/kando-menu/kando/blob/main/docs/installing.md#platform-specific-notes
+See https://kando.menu/installation-on-linux/#-hyprland
 for more information.
 `
     );
@@ -40,9 +41,10 @@ for more information.
    */
   public getBackendInfo() {
     return {
+      name: 'Hyprland Backend',
       windowType: 'splash',
       supportsShortcuts: false,
-      shortcutHint: 'Use your hyprland.conf to bind this.',
+      shortcutHint: i18next.t('backends.hyprland.shortcut-hint'),
     };
   }
 
@@ -97,12 +99,20 @@ for more information.
    * This uses the hyprctl command line tool to execute a command and parse its JSON
    * output.
    *
-   * @param command One of the hyprctl subcommands.
+   * @param subcommand One of the hyprctl subcommands.
    * @returns A promise which resolves to the parsed JSON output of hyprctl.
    */
-  private async hyprctl(command: string): Promise<never> {
+  private async hyprctl(subcommand: string): Promise<never> {
     return new Promise((resolve, reject) => {
-      exec(`hyprctl -j ${command}`, (error, stdout) => {
+      let command = `hyprctl -j ${subcommand}`;
+
+      // If we are inside a flatpak container, we cannot execute commands directly on the host.
+      // Instead we need to use flatpak-spawn.
+      if (process.env.container && process.env.container === 'flatpak') {
+        command = 'flatpak-spawn --host ' + command;
+      }
+
+      exec(command, (error, stdout) => {
         if (error) {
           reject(error);
           return;

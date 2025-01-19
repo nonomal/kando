@@ -8,6 +8,9 @@
 // SPDX-FileCopyrightText: Simon Schneegans <code@simonschneegans.de>
 // SPDX-License-Identifier: MIT
 
+import { MenuOptions } from '../renderer/menu/menu';
+import { EditorOptions } from '../renderer/editor/editor';
+
 /**
  * A simple 2D vector.
  *
@@ -20,6 +23,12 @@ export interface IVec2 {
 
 /** This interface describes some information about the currently used backend. */
 export interface IBackendInfo {
+  /**
+   * The name of the backend. This is shown in the user interface so that users can see
+   * which backend is currently active.
+   */
+  name: string;
+
   /**
    * Each backend should return a suitable window type here. The window type determines
    * how Kando's window is drawn. The most suitable type is dependent on the operating
@@ -46,6 +55,14 @@ export interface IBackendInfo {
    * required.
    */
   shortcutHint?: string;
+}
+
+/** This interface describes some information about the current version of Kando. */
+export interface IVersionInfo {
+  kandoVersion: string;
+  electronVersion: string;
+  chromeVersion: string;
+  nodeVersion: string;
 }
 
 /**
@@ -87,6 +104,9 @@ export interface IMenuThemeDescription {
    */
   maxMenuRadius: number;
 
+  /** The width of the text wrap in the center of the menu in pixels. */
+  centerTextWrapWidth: number;
+
   /**
    * If this is true, children of a menu item will be drawn below the parent. Otherwise
    * they will be drawn above.
@@ -109,6 +129,114 @@ export interface IMenuThemeDescription {
     class: string;
     content: 'none' | 'name' | 'icon';
   }[];
+}
+
+/** This interface describes a icon theme consisting of a collection of icon files. */
+export interface IFileIconThemeDescription {
+  /**
+   * The ID of the theme. This is used to identify the theme in the settings file. It is
+   * also the directory name of the icon theme.
+   */
+  name: string;
+
+  /**
+   * The absolute path to the directory where the theme is stored, including the name as
+   * the last part of the path.
+   */
+  directory: string;
+
+  /**
+   * A list of all available icons in this theme. These are the filenames of the icons
+   * relative to the theme directory. In case of nested directories, the filenames can
+   * actually be paths.
+   */
+  icons: string[];
+}
+
+/**
+ * This interface is used to pass information about all available icon themes to the
+ * renderer process.
+ */
+export interface IIconThemesInfo {
+  /** The absolute path to the directory where the user may store custom icon themes. */
+  userIconDirectory: string;
+
+  /** All available file icon themes. */
+  fileIconThemes: IFileIconThemeDescription[];
+}
+
+/**
+ * Sound themes can define different sounds for different actions. This enum is used to
+ * identify the different sounds.
+ */
+export enum SoundType {
+  eOpenMenu = 'openMenu',
+  eCloseMenu = 'closeMenu',
+  eSelectItem = 'selectItem',
+  eSelectSubmenu = 'selectSubmenu',
+  eSelectParent = 'selectParent',
+  eHoverItem = 'hoverItem',
+  eHoverSubmenu = 'hoverSubmenu',
+  eHoverParent = 'hoverParent',
+}
+
+/**
+ * This interface is used to describe a sound effect. It contains the path to the sound
+ * file and some optional properties like the volume and pitch shift.
+ */
+export interface ISoundEffect {
+  /** The path to the sound file. */
+  file: string;
+
+  /** The volume of the sound. */
+  volume?: number;
+
+  /** The maximum pitch shift. */
+  maxPitch?: number;
+
+  /** The minimum pitch shift. */
+  minPitch?: number;
+}
+
+/**
+ * This interface is used to describe a sound theme. It contains the properties which can
+ * be defined in the JSON file of a sound theme. All paths are relative to the theme
+ * directory.
+ */
+export interface ISoundThemeDescription {
+  /**
+   * The ID of the theme. This is used to identify the theme in the settings file. It is
+   * also the directory name of the theme and is set by Kando when loading the theme.json
+   * file. So the path to the theme.json file is this.directory/this.id/theme.json.
+   */
+  id: string;
+
+  /**
+   * The absolute path to the directory where the theme is stored. This is set by Kando
+   * when loading the theme.json file.
+   */
+  directory: string;
+
+  /** A human readable name of the theme. */
+  name: string;
+
+  /** The author of the theme. */
+  author: string;
+
+  /** The version of the theme. Should be a semantic version string like "1.0.0". */
+  themeVersion: string;
+
+  /** The version of the Kando sound theme engine this theme is compatible with. */
+  engineVersion: number;
+
+  /** The license of the theme. For instance "CC-BY-4.0". */
+  license: string;
+
+  /**
+   * All available sound effects. If a given sound is not defined here, no sound will be
+   * played for the corresponding action.
+   */
+  sounds: Record<SoundType, ISoundEffect>;
 }
 
 /**
@@ -243,6 +371,9 @@ export interface IMenu {
    */
   centered: boolean;
 
+  /** If true, the mouse pointer will be warped to the center of the menu when necessary. */
+  warpMouse: boolean;
+
   /**
    * If true, the menu will be "anchored". This means that any submenus will be opened at
    * the same position as the parent menu.
@@ -268,6 +399,7 @@ export function deepCopyMenu(menu: IMenu): IMenu {
     shortcut: menu.shortcut,
     shortcutID: menu.shortcutID,
     centered: menu.centered,
+    warpMouse: menu.warpMouse,
     anchored: menu.anchored,
     conditions: structuredClone(menu.conditions),
   };
@@ -302,6 +434,12 @@ export interface IShowMenuOptions {
    * opened at the mouse pointer.
    */
   centeredMode: boolean;
+
+  /**
+   * If this is set, the mouse pointer will be warped to the center of the menu when the
+   * menu is opened.
+   */
+  warpMouse: boolean;
 
   /**
    * If this is set, the menu will be "anchored". This means that any submenus will be
@@ -350,6 +488,12 @@ export interface IMenuSettings {
  * the themes to use for the menu and the editor.
  */
 export interface IAppSettings {
+  /**
+   * The locale to use. If set to 'auto', the system's locale will be used. If the locale
+   * is not available, english will be used.
+   */
+  locale: string;
+
   /** The name of the theme to use for the menu. */
   menuTheme: string;
 
@@ -374,12 +518,30 @@ export interface IAppSettings {
    */
   enableDarkModeForMenuThemes: boolean;
 
+  /** The name of the current sound theme. */
+  soundTheme: string;
+
+  /** The overall volume of the sound effects. */
+  soundVolume: number;
+
   /** Set this to false to disable the check for new versions. */
   enableVersionCheck: boolean;
+
+  /** Whether to silently handle read-only config files. */
+  ignoreWriteProtectedConfigFiles: boolean;
+
+  /** The tray icon flavor. */
+  trayIconFlavor: 'light' | 'dark' | 'color' | 'black' | 'white' | 'none';
 
   /** Whether the sidebar should be shown in the editor. */
   sidebarVisible: boolean;
 
   /** A scale factor for the menu. */
   zoomFactor: number;
+
+  /** The options which are passed to the menu. */
+  menuOptions: MenuOptions;
+
+  /** The options which are passed to the menu editor. */
+  editorOptions: EditorOptions;
 }
